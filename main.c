@@ -55,9 +55,12 @@ PGM_P alphatable_p PROGMEM = alphatable;
 
 volatile uint8_t digit1, digit2, digit3;
 
+volatile int16_t millisec_counter;
+uint8_t clock_running;
+
 volatile int16_t button_timer;
-#define SHORT_PRESS_TIME 50 // short click milliseconds
-#define LONG_PRESS_TIME 3000 // long (press and hold) 3 seconds timeout
+//#define SHORT_PRESS_TIME 50 // short click milliseconds
+#define LONG_PRESS_TIME 1000 // long (press and hold) 3 seconds timeout
 
 volatile uint16_t number;
 #define DIGITS 3
@@ -67,6 +70,8 @@ volatile uint8_t per_digit_timer;
 volatile uint32_t poweroff_timer = 0;
 #define POWEROFF_TIME 5 * 60 * 1000UL // 5 minutes * 60 seconds/min * 1000 millisec/sec
 
+#define TIMER1RELOAD 550    // does not make any impact
+
 
 //char *display_string = "abcdefghijklmnopqrstuvwxyz  ";
 char *display_string = "   digg";
@@ -74,7 +79,8 @@ volatile uint8_t string_index = 0;
 volatile uint16_t display_timer = 0;
 #define SCROLL_SPEED 300UL
 
-SIGNAL (SIG_INT0) {
+SIGNAL (SIG_INT0) 
+{
   GIMSK = 0;
   poweroff_timer = 0;
   button_timer == 0xFFFF;
@@ -83,38 +89,50 @@ SIGNAL (SIG_INT0) {
   }
 }
 
-SIGNAL (SIG_OUTPUT_COMPARE0A) {
-  if (button_timer != 0xFFFF) {
+SIGNAL (SIG_OVERFLOW1)
+{   
+   TCNT1  = TIMER1RELOAD; // Reload timer with precalculated value
+   millisec_counter++;
+} 
+
+
+SIGNAL (SIG_OUTPUT_COMPARE0A) 
+{
+  if (button_timer != 0xFFFF) 
+  {
     button_timer++;
   }
-
-  if (display_timer != 0xFFFF) {
+  
+  if (display_timer != 0xFFFF) 
+  {
     display_timer++;
-    if (display_timer >= SCROLL_SPEED) {
+    if (display_timer >= SCROLL_SPEED) 
+	{
       display_timer = 0;
       string_index++;
       if (string_index > strlen(display_string)+3)
-	string_index -= strlen(display_string);
+	    string_index -= strlen(display_string);
     }
   }
 
-  if (PINA & 0x1) {
-    if (poweroff_timer < POWEROFF_TIME) {
+  if (PINA & 0x1) 
+  {	
+    if (poweroff_timer < POWEROFF_TIME) 
+	{
       poweroff_timer++;
-    } else {
+    } 
+	else 
+	{
       // time to sleep!
       // turn off all LEDs
       
-      display_digit(9, 99);
-      MCUCR |= _BV(SM1) | _BV(SM0) | _BV(SE);
-      GIMSK = _BV(INT0);
-      sei();
-      asm("sleep");
+	  shutdown();
     }
   } // otherwise, its always on!
   
   
-  if ((PINA & 0x2) && (number <= 999)) { /* display whatever is stored in the number variable */
+  if ((PINA & 0x2) && (number <= 999))  /* display whatever is stored in the number variable */
+  {
     // display a number
     if (number >= 100) {
       digit1 = hundreds(number);
@@ -169,6 +187,18 @@ SIGNAL (SIG_OUTPUT_COMPARE0A) {
   }
 }
 
+
+void shutdown()
+{
+      number = 0;
+	  millisec_counter = 0;
+	  clock_running = 0;	
+	  display_digit(9, 99);
+      MCUCR |= _BV(SM1) | _BV(SM0) | _BV(SE);
+      GIMSK = _BV(INT0);
+      sei();
+      asm("sleep");
+}
 
 
 void display_one(uint8_t d) {
@@ -265,7 +295,6 @@ uint8_t segments(uint8_t value) {
 
 int main(void) {
   uint8_t button_state, last_button_state, cleared = 0;
-  uint16_t temp;
 
   DDRB = 0xFF;
   DDRD = 0xFF;
@@ -277,18 +306,29 @@ int main(void) {
   BUTTON_DDR &= ~_BV(BUTTON);
   BUTTON_PORT |= _BV(BUTTON);
   
-  number = eeprom_read_word(&stored_number);
   
-  // set up an interrupt that goes off @ 1KHz)
-  TCCR0A = _BV(WGM01);
-  TCCR0B = 2; // 500K/8 = 62.3KHz
-  OCR0A = 63; // divide that by 63 -> 1KHz
-  TIMSK = _BV(OCIE0A); // turn on the interrupt
+  // set up an interrupt that goes off @ 1KHz) (internal clock is 8MHz)
+  TCCR0A = _BV(WGM01);                          //timer control register A
+  TCCR0B = 2; // 500K/8 = 62.3KHz               //timer control register B  //Cs2 per 8
+  OCR0A = 63; // divide that by 63 -> 1KHz      //ouptut compare
+  TIMSK |= _BV(OCIE0A); // turn on the interrupt
+
+  //Set up second timer 
+  TCNT1 = TIMER1RELOAD; // Preload timer with precalculated value
+  TCCR1A = _BV(WGM01); 
+  TCCR1B |= ((1 << CS10)); // Set up timer at Fcpu/64 
+  //TCCR1B |= ((1 << CS10) | (1 << CS11)); // Set up timer at Fcpu/64 
+  TIMSK |= (1 << TOIE1); // Enable overflow interrupt 
+
   sei(); // turn on interrupts
   // now all the LED stuff (persistence of vision) is done in interrupts, so watch for button presses
   
   button_timer = 0xFFFF;
   last_button_state = button_state = 1;
+
+  millisec_counter = 0;
+  clock_running = 1;
+  number = 0;
 
   while (1) {
     // first, debounce the switch by performing a lowpass filter: the button
@@ -330,46 +370,47 @@ int main(void) {
     // debounce/lowpassing done, 
     // button_state tells whether the button is pressed (0) or released (1)
     // now see if it was a short or long press
-    if (!button_state && last_button_state) { // just pressed
-      last_button_state = button_state;
-      // do nothing
+    
+	if (!button_state && last_button_state)  // just pressed
+    {
+	  last_button_state = button_state;
+      // do nothing. Not distinguishing button down, as hold will come after 3 sec it went down,
     }
    
-    if (!button_state && !last_button_state && 
-	(button_timer >= LONG_PRESS_TIME)) { // pressed and held
-      number = 0;
-      eeprom_write_word(&stored_number, number);
+    if (!button_state && !last_button_state && (button_timer >= LONG_PRESS_TIME))  // pressed and held
+    {
+	  if (number == 0)  // send it to sleep
+	  {
+	  	 //shutdown();   // not working yet TODO
+	  }
+	  number = 0;
+	  clock_running = 0;
       cleared = 1; // just cleared
     }
 
-   if (button_state && !last_button_state && !cleared) { // just released
-      last_button_state = button_state;
-      temp = number+1;
-      number = 1001;
-      digit1 = 'd';
-      digit2 = 'u';
-      digit3 = 'g';
-      delay_ms(250);
-      delay_ms(250);
-      delay_ms(250);
-      number = temp;
-      eeprom_write_word(&stored_number, number); 
+    if (button_state && !last_button_state && !cleared)  // just released
+	{ 
+		if (clock_running == 1) 
+		{
+			clock_running = 0;
+		}	
+		else 
+		{
+			millisec_counter = 0;
+			clock_running = 1;			
+		}
+		cleared = 1; // just cleared
     }
 
 
-   // do special stuff
-    if ((number >= 1000) || !(PINA & 0x2)) {
-      if (number == 1000) 
-	string_index = 0;
-
-      digit1 = display_string[string_index%strlen(display_string)];
-      digit2 = display_string[(string_index+1)%strlen(display_string)];
-      digit3 = display_string[(string_index+2)%strlen(display_string)];
-      if (number == 1000)
-	delay_ms(100);
-      number = 1001;
-      poweroff_timer = 0;
-    }
+	if (clock_running > 0) 
+	{		
+		if (millisec_counter > 852) 
+		{
+			millisec_counter = 0;
+			number++;			
+		}
+	}
   }
 }
 
